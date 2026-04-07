@@ -338,3 +338,88 @@ abstract contract QGLPToken is QGEIP712 {
         bytes32 digest = _hashTyped(structHash);
 
         address recovered = ecrecover(digest, v, r, s);
+        if (recovered == address(0) || recovered != owner) revert QGLP_BadSig();
+
+        _approve(owner, spender, value);
+    }
+
+    function _approve(address owner, address spender, uint256 amount) internal {
+        allowance[owner][spender] = amount;
+        emit Approval(owner, spender, amount);
+    }
+
+    function _transfer(address from, address to, uint256 amount) internal {
+        if (to == address(0)) revert QGLP_Zero();
+        uint256 b = balanceOf[from];
+        if (b < amount) revert QGLP_Insufficient();
+        unchecked {
+            balanceOf[from] = b - amount;
+            balanceOf[to] += amount;
+        }
+        emit Transfer(from, to, amount);
+    }
+
+    function _mint(address to, uint256 amount) internal {
+        if (to == address(0)) revert QGLP_Zero();
+        totalSupply += amount;
+        unchecked {
+            balanceOf[to] += amount;
+        }
+        emit Transfer(address(0), to, amount);
+    }
+
+    function _burn(address from, uint256 amount) internal {
+        uint256 b = balanceOf[from];
+        if (b < amount) revert QGLP_Insufficient();
+        unchecked {
+            balanceOf[from] = b - amount;
+            totalSupply -= amount;
+        }
+        emit Transfer(from, address(0), amount);
+    }
+}
+
+// =============================================================
+// Quantguriosa Pool (single pool contract; deploy one per pair)
+// =============================================================
+
+contract Quantguriosa is QGLPToken, QGReentrancy {
+    using QGAddress for IERC20Like;
+    using QGMath for uint256;
+
+    // -----------------------------
+    // Custom errors (unique prefixes)
+    // -----------------------------
+    error QG_Unauthorized();
+    error QG_Paused();
+    error QG_Same();
+    error QG_Zero();
+    error QG_Bounds();
+    error QG_NotReady();
+    error QG_Stale();
+    error QG_FeeTooHigh();
+    error QG_Slippage();
+    error QG_BadToken();
+    error QG_ReserveSkew();
+    error QG_OracleFull();
+    error QG_OracleEmpty();
+    error QG_BadSig();
+    error QG_TooLarge();
+    error QG_NoLiquidity();
+    error QG_KInvariant();
+    error QG_Dupe();
+    error QG_FlashDebt();
+    error QG_CallbackOnly();
+    error QG_ProtocolOff();
+
+    // -----------------------------
+    // Events
+    // -----------------------------
+    event QG_AdminProposed(address indexed admin, address indexed proposed);
+    event QG_AdminAccepted(address indexed oldAdmin, address indexed newAdmin);
+    event QG_GuardianSet(address indexed oldGuardian, address indexed newGuardian);
+    event QG_PauseSet(bool paused);
+
+    event QG_Minted(address indexed provider, uint256 amount0In, uint256 amount1In, uint256 sharesOut, address indexed to);
+    event QG_Burned(address indexed provider, uint256 sharesIn, uint256 amount0Out, uint256 amount1Out, address indexed to);
+    event QG_Swapped(
