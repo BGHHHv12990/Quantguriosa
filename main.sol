@@ -423,3 +423,88 @@ contract Quantguriosa is QGLPToken, QGReentrancy {
     event QG_Minted(address indexed provider, uint256 amount0In, uint256 amount1In, uint256 sharesOut, address indexed to);
     event QG_Burned(address indexed provider, uint256 sharesIn, uint256 amount0Out, uint256 amount1Out, address indexed to);
     event QG_Swapped(
+        address indexed trader,
+        address indexed tokenIn,
+        uint256 amountIn,
+        address indexed tokenOut,
+        uint256 amountOut,
+        uint24 feeBps,
+        bytes16 tag
+    );
+    event QG_Skimmed(address indexed to, uint256 excess0, uint256 excess1);
+    event QG_OraclePushed(uint32 indexed idx, uint64 ts, uint128 r0, uint128 r1, uint32 qk, uint32 vol);
+    event QG_ParamsSet(uint24 feeBaseBps, uint24 feeMaxBps, uint32 gammaE8, uint32 oraclePeriod, uint16 oracleSlots);
+    event QG_ProtocolSet(address indexed feeTo, uint16 protocolShareBps, bool on);
+    event QG_ProtocolCollected(address indexed feeTo, uint256 amount0, uint256 amount1);
+    event QG_Flash(address indexed initiator, address indexed receiver, uint256 amount0, uint256 amount1, uint24 feeBps, bytes16 tag);
+
+    // -----------------------------
+    // Immutable "genesis pins" (random-looking)
+    // -----------------------------
+    address public immutable GENESIS_ANCHOR;
+    address public immutable GENESIS_LANTERN;
+    address public immutable GENESIS_WARD;
+
+    // -----------------------------
+    // Admin / guardian / pause (two-step)
+    // -----------------------------
+    address public admin;
+    address public proposedAdmin;
+    address public guardian;
+    bool public paused;
+
+    modifier onlyAdmin() {
+        if (msg.sender != admin) revert QG_Unauthorized();
+        _;
+    }
+    modifier onlyGuardian() {
+        if (msg.sender != guardian) revert QG_Unauthorized();
+        _;
+    }
+    modifier whenActive() {
+        if (paused) revert QG_Paused();
+        _;
+    }
+
+    // -----------------------------
+    // Pool tokens + reserves
+    // -----------------------------
+    IERC20Like public immutable token0;
+    IERC20Like public immutable token1;
+    uint8 public immutable token0Decimals;
+    uint8 public immutable token1Decimals;
+
+    // reserves are stored as uint128 to keep storage compact and math bounded
+    uint128 public reserve0;
+    uint128 public reserve1;
+    uint64 public lastSyncTs;
+
+    // -----------------------------
+    // Protocol fee routing (optional)
+    // -----------------------------
+    // protocolShareBps: how much of swap fee is siphoned to feeTo (basis points of fee amount)
+    // If protocolOn=false, all fees stay in the pool.
+    bool public protocolOn;
+    address public feeTo;
+    uint16 public protocolShareBps; // 0..2500 (25%), bounded
+    uint128 public accrued0;
+    uint128 public accrued1;
+
+    // -----------------------------
+    // Fee/curve parameters
+    // -----------------------------
+    // fee in basis points (1e4 = 100%)
+    uint24 public feeBaseBps; // low-vol baseline fee
+    uint24 public feeMaxBps; // cap
+    uint32 public gammaE8; // curvature parameter, scaled 1e8; affects extra fee responsiveness
+    uint32 public oraclePeriod; // seconds between oracle samples (soft)
+    uint16 public oracleSlots; // ring buffer length (bounded)
+
+    // -----------------------------
+    // Oracle ring buffer
+    // -----------------------------
+    struct Obs {
+        uint64 ts; // timestamp
+        uint128 r0;
+        uint128 r1;
+        uint32 qk; // quantized k snapshot (for cheap drift tests)
