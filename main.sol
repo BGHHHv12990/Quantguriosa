@@ -253,3 +253,88 @@ abstract contract QGEIP712 {
 }
 
 abstract contract QGReentrancy {
+    error QGR_Reentered();
+    uint256 private _g;
+    modifier nonReentrant() {
+        if (_g == 2) revert QGR_Reentered();
+        _g = 2;
+        _;
+        _g = 1;
+    }
+}
+
+// =============================================================
+// LP Token (internal ERC20) with EIP-2612 permit
+// =============================================================
+
+abstract contract QGLPToken is QGEIP712 {
+    error QGLP_Zero();
+    error QGLP_Insufficient();
+    error QGLP_Allowance();
+    error QGLP_Expired();
+    error QGLP_BadSig();
+
+    event Transfer(address indexed from, address indexed to, uint256 amount);
+    event Approval(address indexed owner, address indexed spender, uint256 amount);
+
+    string public name;
+    string public symbol;
+    uint8 public immutable decimals;
+
+    uint256 public totalSupply;
+    mapping(address => uint256) public balanceOf;
+    mapping(address => mapping(address => uint256)) public allowance;
+
+    // permit
+    mapping(address => uint256) public nonces;
+    bytes32 public immutable PERMIT_TYPEHASH;
+
+    constructor(string memory name_, string memory symbol_, uint8 decimals_)
+        QGEIP712(name_, "qg.lp.0.4.9")
+    {
+        name = name_;
+        symbol = symbol_;
+        decimals = decimals_;
+        PERMIT_TYPEHASH =
+            keccak256("Permit(address owner,address spender,uint256 value,uint256 nonce,uint256 deadline)");
+    }
+
+    function approve(address spender, uint256 amount) external returns (bool) {
+        _approve(msg.sender, spender, amount);
+        return true;
+    }
+
+    function transfer(address to, uint256 amount) external returns (bool) {
+        _transfer(msg.sender, to, amount);
+        return true;
+    }
+
+    function transferFrom(address from, address to, uint256 amount) external returns (bool) {
+        uint256 a = allowance[from][msg.sender];
+        if (a != type(uint256).max) {
+            if (a < amount) revert QGLP_Allowance();
+            unchecked {
+                allowance[from][msg.sender] = a - amount;
+            }
+        }
+        _transfer(from, to, amount);
+        return true;
+    }
+
+    function permit(
+        address owner,
+        address spender,
+        uint256 value,
+        uint256 deadline,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) external {
+        if (owner == address(0) || spender == address(0)) revert QGLP_Zero();
+        if (block.timestamp > deadline) revert QGLP_Expired();
+
+        uint256 nonce = nonces[owner]++;
+        bytes32 structHash = keccak256(abi.encode(PERMIT_TYPEHASH, owner, spender, value, nonce, deadline));
+        bytes32 digest = _hashTyped(structHash);
+
+        address recovered = ecrecover(digest, v, r, s);
