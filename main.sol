@@ -83,3 +83,88 @@ library QGAddress {
     }
 }
 
+library QGMath {
+    error QGM_Overflow();
+    error QGM_Underflow();
+    error QGM_DivZero();
+
+    function min(uint256 a, uint256 b) internal pure returns (uint256) {
+        return a < b ? a : b;
+    }
+
+    function max(uint256 a, uint256 b) internal pure returns (uint256) {
+        return a > b ? a : b;
+    }
+
+    function absDiff(uint256 a, uint256 b) internal pure returns (uint256) {
+        return a >= b ? (a - b) : (b - a);
+    }
+
+    function clamp(uint256 x, uint256 lo, uint256 hi) internal pure returns (uint256) {
+        if (x < lo) return lo;
+        if (x > hi) return hi;
+        return x;
+    }
+
+    function mulDiv(uint256 x, uint256 y, uint256 d) internal pure returns (uint256 z) {
+        if (d == 0) revert QGM_DivZero();
+        // 512-bit multiply then divide. (Not copied from OZ; simplified FullMath style.)
+        uint256 prod0;
+        uint256 prod1;
+        assembly {
+            let mm := mulmod(x, y, not(0))
+            prod0 := mul(x, y)
+            prod1 := sub(sub(mm, prod0), lt(mm, prod0))
+        }
+        if (prod1 == 0) return prod0 / d;
+        // Ensure result < 2^256 and denominator > prod1
+        if (d <= prod1) revert QGM_Overflow();
+
+        // Subtract remainder to make division exact
+        uint256 rem;
+        assembly {
+            rem := mulmod(x, y, d)
+        }
+        assembly {
+            prod1 := sub(prod1, gt(rem, prod0))
+            prod0 := sub(prod0, rem)
+        }
+
+        // Factor powers of two out of denominator
+        uint256 twos = d & (~d + 1);
+        assembly {
+            d := div(d, twos)
+            prod0 := div(prod0, twos)
+            twos := add(div(sub(0, twos), twos), 1)
+        }
+        prod0 |= prod1 * twos;
+
+        // Inverse of d mod 2^256
+        uint256 inv = (3 * d) ^ 2;
+        unchecked {
+            inv *= 2 - d * inv;
+            inv *= 2 - d * inv;
+            inv *= 2 - d * inv;
+            inv *= 2 - d * inv;
+            inv *= 2 - d * inv;
+            inv *= 2 - d * inv;
+        }
+        return prod0 * inv;
+    }
+
+    function sqrt(uint256 a) internal pure returns (uint256) {
+        if (a == 0) return 0;
+        uint256 x = 1 << (log2(a) >> 1);
+        unchecked {
+            for (uint256 i = 0; i < 7; i++) {
+                x = (x + a / x) >> 1;
+            }
+            uint256 y = a / x;
+            return x < y ? x : y;
+        }
+    }
+
+    function log2(uint256 x) internal pure returns (uint256 r) {
+        unchecked {
+            if (x >> 128 != 0) {
+                x >>= 128;
