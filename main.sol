@@ -168,3 +168,88 @@ library QGMath {
         unchecked {
             if (x >> 128 != 0) {
                 x >>= 128;
+                r += 128;
+            }
+            if (x >> 64 != 0) {
+                x >>= 64;
+                r += 64;
+            }
+            if (x >> 32 != 0) {
+                x >>= 32;
+                r += 32;
+            }
+            if (x >> 16 != 0) {
+                x >>= 16;
+                r += 16;
+            }
+            if (x >> 8 != 0) {
+                x >>= 8;
+                r += 8;
+            }
+            if (x >> 4 != 0) {
+                x >>= 4;
+                r += 4;
+            }
+            if (x >> 2 != 0) {
+                x >>= 2;
+                r += 2;
+            }
+            if (x >> 1 != 0) {
+                r += 1;
+            }
+        }
+    }
+}
+
+library QGECDSA {
+    error QGE_BadSigLength();
+    error QGE_BadS();
+    error QGE_BadV();
+
+    // secp256k1n/2 (same constant, different naming)
+    uint256 internal constant _HALF_N =
+        0x7fffffffffffffffffffffffffffffff5d576e7357a4501ddfe92f46681b20a0;
+
+    function recover(bytes32 digest, bytes calldata sig) internal pure returns (address signer) {
+        if (sig.length != 65) revert QGE_BadSigLength();
+        bytes32 r;
+        bytes32 s;
+        uint8 v;
+        assembly {
+            r := calldataload(sig.offset)
+            s := calldataload(add(sig.offset, 32))
+            v := byte(0, calldataload(add(sig.offset, 64)))
+        }
+        if (uint256(s) > _HALF_N) revert QGE_BadS();
+        if (v != 27 && v != 28) revert QGE_BadV();
+        return ecrecover(digest, v, r, s);
+    }
+
+    function toEthSignedMessageHash(bytes32 h) internal pure returns (bytes32) {
+        return keccak256(abi.encodePacked("\x19Ethereum Signed Message:\n32", h));
+    }
+}
+
+abstract contract QGEIP712 {
+    bytes32 private immutable _NAME_HASH;
+    bytes32 private immutable _VER_HASH;
+    bytes32 private immutable _DOMAIN_TYPEHASH;
+
+    constructor(string memory name, string memory version) {
+        _NAME_HASH = keccak256(bytes(name));
+        _VER_HASH = keccak256(bytes(version));
+        _DOMAIN_TYPEHASH = keccak256(
+            "EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"
+        );
+    }
+
+    function _domainSeparator() internal view returns (bytes32) {
+        return keccak256(abi.encode(_DOMAIN_TYPEHASH, _NAME_HASH, _VER_HASH, block.chainid, address(this)));
+    }
+
+    function _hashTyped(bytes32 structHash) internal view returns (bytes32) {
+        return keccak256(abi.encodePacked("\x19\x01", _domainSeparator(), structHash));
+    }
+}
+
+abstract contract QGReentrancy {
