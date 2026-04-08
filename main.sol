@@ -1358,3 +1358,82 @@ contract Quantguriosa is QGLPToken, QGReentrancy {
                 if (ny > type(uint128).max) revert QG_TooLarge();
                 accrued1 = uint128(ny);
                 token1.safeTransfer(feeTo, p1);
+            }
+        }
+
+        // Update reserves
+        if (b0After > type(uint128).max || b1After > type(uint128).max) revert QG_TooLarge();
+        _setReserves(uint128(b0After), uint128(b1After));
+        _maybePushOracle();
+
+        emit QG_Flash(msg.sender, receiver, amount0, amount1, feeBps, tag);
+    }
+
+    // =============================================================
+    // Safety: signature-gated "rescue" of non-pool tokens
+    // =============================================================
+
+    bytes4 private constant _ERC1271_MAGIC = 0x1626ba7e;
+    bytes32 public immutable RESCUE_TYPEHASH =
+        keccak256("Rescue(address token,address to,uint256 amount,bytes32 nonce,uint256 deadline,bytes32 salt)");
+    mapping(bytes32 => bool) public usedRescueNonce;
+
+    function rescueBySig(
+        address token,
+        address to,
+        uint256 amount,
+        uint256 deadline,
+        bytes32 nonce,
+        bytes calldata sig
+    ) external nonReentrant whenActive {
+        if (token == address(0) || to == address(0)) revert QG_Zero();
+        if (block.timestamp > deadline) revert QG_Expired();
+        if (token == address(token0) || token == address(token1)) revert QG_BadToken();
+        if (amount == 0) revert QG_Zero();
+
+        bytes32 key = keccak256(abi.encodePacked(nonce, token, to, amount, deadline));
+        if (usedRescueNonce[key]) revert QG_Dupe();
+        usedRescueNonce[key] = true;
+
+        bytes32 structHash = keccak256(abi.encode(RESCUE_TYPEHASH, token, to, amount, nonce, deadline, POOL_SALT));
+        bytes32 digest = _hashTyped(structHash);
+
+        _assertGuardianSig(digest, sig);
+        IERC20Like(token).safeTransfer(to, amount);
+    }
+
+    // NOTE: separate deadline error name to stay unique with QGLP
+    error QG_Expired();
+
+    function _assertGuardianSig(bytes32 digest, bytes calldata sig) internal view {
+        address g = guardian;
+        if (g == address(0)) revert QG_Zero();
+        if (QGAddress.isContract(g)) {
+            bytes4 mv = IERC1271Like(g).isValidSignature(digest, sig);
+            if (mv != _ERC1271_MAGIC) revert QG_BadSig();
+        } else {
+            address rec = QGECDSA.recover(digest, sig);
+            if (rec != g) revert QG_BadSig();
+        }
+    }
+
+    // =============================================================
+    // Internal: decimals reader (defensive)
+    // =============================================================
+
+    function _readDecimals(IERC20Like t) internal view returns (uint8 d) {
+        (bool ok, bytes memory ret) = address(t).staticcall(abi.encodeWithSelector(t.decimals.selector));
+        if (!ok || ret.length < 32) return 18;
+        uint256 v = abi.decode(ret, (uint256));
+        if (v > 255) return 18;
+        return uint8(v);
+    }
+
+    // =============================================================
+    // Fallback: reject accidental ETH
+    // =============================================================
+
+    receive() external payable {
+        revert QG_Zero();
+    }
+}
