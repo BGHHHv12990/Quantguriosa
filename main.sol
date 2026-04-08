@@ -1188,3 +1188,88 @@ contract Quantguriosa is QGLPToken, QGReentrancy {
         if (obsCount != 0) {
             Obs memory last = _obs[obsHead];
             if (nowTs < last.ts + oraclePeriod) return;
+        }
+        _pushOracle(nowTs);
+    }
+
+    function pushOracleNow() external nonReentrant whenActive {
+        _pushOracle(uint64(block.timestamp));
+    }
+
+    function _pushOracle(uint64 ts) internal {
+        uint128 r0 = reserve0;
+        uint128 r1 = reserve1;
+        if (r0 == 0 || r1 == 0) revert QG_NotReady();
+
+        uint32 nextIdx = _incIdx(obsHead);
+        if (obsCount < oracleSlots) {
+            obsCount += 1;
+        }
+
+        uint32 kQ = _quantizeK(uint256(r0) * uint256(r1), r0, r1);
+        uint32 volQ = _computeVol(ts, r0, r1, kQ);
+
+        _obs[nextIdx] = Obs({ts: ts, r0: r0, r1: r1, qk: kQ, vol: volQ});
+        obsHead = nextIdx;
+
+        emit QG_OraclePushed(nextIdx, ts, r0, r1, kQ, volQ);
+    }
+
+    function _computeVol(uint64 ts, uint128 r0, uint128 r1, uint32 kQ) internal view returns (uint32) {
+        // Volatility proxy:
+        // - compare last two observations if exist
+        // - use relative change in price ratio and k-quant change
+        // - add a small pulse based on time gaps (encourages sampling)
+        if (obsCount == 0) return 0;
+        Obs memory last = _obs[obsHead];
+
+        // if timestamps go backwards (shouldn't), return a big-ish number
+        if (ts <= last.ts) return uint32(1_700_000);
+
+        uint256 dt = uint256(ts - last.ts);
+        // ratio change in r0/r1 using cross-multiplication to avoid division
+        uint256 p0 = uint256(last.r0) * uint256(r1);
+        uint256 p1 = uint256(r0) * uint256(last.r1);
+        uint256 diff = QGMath.absDiff(p0, p1);
+        uint256 base = p0 + p1 + 1;
+
+        // scaled ppm-ish
+        uint256 ratioPpm = (diff * 1_000_000) / base;
+        uint256 kDiff = QGMath.absDiff(uint256(kQ), uint256(last.qk));
+
+        // time pulse: longer gaps imply less confidence => add mild "vol"
+        uint256 timePulse = QGMath.clamp(dt * 700, 0, 420_000);
+
+        // combine
+        uint256 v = ratioPpm * 9 + kDiff * 13 + timePulse;
+        if (v > type(uint32).max) v = type(uint32).max;
+        return uint32(v);
+    }
+
+    function _quantizeK(uint256 k, uint128 r0, uint128 r1) internal pure returns (uint32) {
+        // Quantize using a log-ish scheme, mixing in a skew term so two
+        // different reserve pairs with same k don't always collide.
+        uint256 skew = QGMath.absDiff(uint256(r0), uint256(r1));
+        uint256 s = (skew * 1_000_000) / (uint256(r0) + uint256(r1) + 1);
+        uint256 x = k + (k / 97) + (s * (k / 10_000 + 1));
+        uint256 l2 = QGMath.log2(x + 1);
+        uint256 top = (l2 * _KLOG_SCALE) + (x / (1 << QGMath.min(l2, 63)));
+        if (top > type(uint32).max) top = type(uint32).max;
+        return uint32(top);
+    }
+
+    function _incIdx(uint32 i) internal view returns (uint32) {
+        uint32 n = uint32(oracleSlots);
+        unchecked {
+            i += 1;
+        }
+        if (i >= n) i = 0;
+        return i;
+    }
+
+    function _decIdx(uint32 i) internal view returns (uint32) {
+        uint32 n = uint32(oracleSlots);
+        if (i == 0) return n - 1;
+        unchecked {
+            return i - 1;
+        }
