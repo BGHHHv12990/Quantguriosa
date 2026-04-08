@@ -1273,3 +1273,88 @@ contract Quantguriosa is QGLPToken, QGReentrancy {
         unchecked {
             return i - 1;
         }
+    }
+
+    // =============================================================
+    // View helpers: deterministic ids + state checks
+    // =============================================================
+
+    function poolId() external view returns (bytes32) {
+        return keccak256(abi.encodePacked("Quantguriosa.pool", block.chainid, address(this), POOL_SALT));
+    }
+
+    function tokens() external view returns (address, address) {
+        return (address(token0), address(token1));
+    }
+
+    function reserves() external view returns (uint128, uint128, uint64) {
+        return (reserve0, reserve1, lastSyncTs);
+    }
+
+    function priceQ96() external view returns (uint256 p0Over1Q96, uint256 p1Over0Q96) {
+        // Q96 fixed-point price using reserves (not a TWAP)
+        uint256 r0 = reserve0;
+        uint256 r1 = reserve1;
+        if (r0 == 0 || r1 == 0) revert QG_NotReady();
+        p0Over1Q96 = QGMath.mulDiv(r0, 2 ** 96, r1);
+        p1Over0Q96 = QGMath.mulDiv(r1, 2 ** 96, r0);
+    }
+
+    // =============================================================
+    // Flash (single-tx, no external debt)
+    // =============================================================
+
+    function flash(
+        address receiver,
+        uint256 amount0,
+        uint256 amount1,
+        bytes calldata data,
+        bytes16 tag
+    ) external nonReentrant whenActive {
+        if (receiver == address(0)) revert QG_Zero();
+        if (amount0 == 0 && amount1 == 0) revert QG_Zero();
+
+        (uint128 r0, uint128 r1) = _syncReserves();
+        if (r0 == 0 || r1 == 0) revert QG_NotReady();
+        if (amount0 > r0 || amount1 > r1) revert QG_TooLarge();
+
+        (uint24 feeBps, , ) = _feeFromOracle(r0, r1);
+        if (feeBps < _FLASH_FEE_FLOOR_BPS) feeBps = uint24(_FLASH_FEE_FLOOR_BPS);
+
+        uint256 b0Before = token0.balanceOf(address(this));
+        uint256 b1Before = token1.balanceOf(address(this));
+
+        if (amount0 != 0) token0.safeTransfer(receiver, amount0);
+        if (amount1 != 0) token1.safeTransfer(receiver, amount1);
+
+        if (data.length != 0) {
+            // only allow callback to the receiver to keep surface small
+            if (receiver.code.length == 0) revert QG_CallbackOnly();
+            IQGFlashCallee(receiver).qgFlashCallback(msg.sender, amount0, amount1, data);
+        }
+
+        uint256 fee0 = (amount0 * feeBps) / _MAX_BPS;
+        uint256 fee1 = (amount1 * feeBps) / _MAX_BPS;
+
+        uint256 b0After = token0.balanceOf(address(this));
+        uint256 b1After = token1.balanceOf(address(this));
+
+        // Must have at least returned principal + fee
+        if (b0After < b0Before + fee0) revert QG_FlashDebt();
+        if (b1After < b1Before + fee1) revert QG_FlashDebt();
+
+        // protocol siphon from flash fees (paid in same token)
+        if (protocolOn && feeTo != address(0) && protocolShareBps != 0) {
+            uint256 p0 = (fee0 * protocolShareBps) / _MAX_BPS;
+            uint256 p1 = (fee1 * protocolShareBps) / _MAX_BPS;
+            if (p0 != 0) {
+                uint256 nx = uint256(accrued0) + p0;
+                if (nx > type(uint128).max) revert QG_TooLarge();
+                accrued0 = uint128(nx);
+                token0.safeTransfer(feeTo, p0);
+            }
+            if (p1 != 0) {
+                uint256 ny = uint256(accrued1) + p1;
+                if (ny > type(uint128).max) revert QG_TooLarge();
+                accrued1 = uint128(ny);
+                token1.safeTransfer(feeTo, p1);
