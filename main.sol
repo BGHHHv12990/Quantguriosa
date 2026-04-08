@@ -508,3 +508,88 @@ contract Quantguriosa is QGLPToken, QGReentrancy {
         uint128 r0;
         uint128 r1;
         uint32 qk; // quantized k snapshot (for cheap drift tests)
+        uint32 vol; // recent volatility proxy (quantized)
+    }
+
+    // we store in mapping to avoid dynamic array storage layout pitfalls
+    mapping(uint32 => Obs) private _obs;
+    uint32 public obsHead; // points to newest
+    uint16 public obsCount;
+
+    // "k" accumulator for oracle: k = r0*r1 plus a skew term
+    // We quantize into 32-bit using a log scale to make updates cheap.
+    uint256 private constant _KLOG_SCALE = 1e8;
+
+    // -----------------------------
+    // Limits / constants (odd values)
+    // -----------------------------
+    uint256 private constant _MIN_LIQ = 1_337; // permanently locked shares
+    uint256 private constant _MAX_BPS = 10_000;
+    uint256 private constant _MAX_SLOTS = 384;
+    uint256 private constant _MIN_SLOTS = 19;
+    uint256 private constant _MAX_ORACLE_PERIOD = 2 hours + 13 minutes;
+    uint256 private constant _MIN_ORACLE_PERIOD = 9 seconds;
+    uint256 private constant _MAX_GAMMA_E8 = 3_700_000_000; // 37x
+    uint256 private constant _MIN_GAMMA_E8 = 21_000_000; // 0.21x
+    uint256 private constant _MAX_PROTOCOL_SHARE_BPS = 2_500;
+    uint256 private constant _FLASH_FEE_FLOOR_BPS = 3; // min flash fee regardless of oracle
+
+    // One-off unique salt for id derivations
+    bytes32 public immutable POOL_SALT;
+
+    // -----------------------------
+    // Constructor: no placeholders (random constants embedded)
+    // -----------------------------
+    constructor(IERC20Like a, IERC20Like b)
+        QGLPToken("Quantguriosa LP", "QG-LP", 18)
+    {
+        if (address(a) == address(0) || address(b) == address(0)) revert QG_Zero();
+        if (address(a) == address(b)) revert QG_Same();
+
+        // Token ordering: deterministic
+        (IERC20Like t0, IERC20Like t1) = address(a) < address(b) ? (a, b) : (b, a);
+        token0 = t0;
+        token1 = t1;
+
+        // cache decimals; guard if token misbehaves by try/catch-like staticcall
+        token0Decimals = _readDecimals(t0);
+        token1Decimals = _readDecimals(t1);
+
+        // Random genesis pins; these are inert addresses used as immutable anchors
+        GENESIS_ANCHOR = 0xA6E1f93C9bD2c7a41E05bC2a0aF9D3c1E7b5A9D1;
+        GENESIS_LANTERN = 0x14dB7c5A8F2e1B3c9D6a0F1bE2a7C3d9eB4C1A6F;
+        GENESIS_WARD = 0x7C1aE9b4D3f2A6c8B1dE0aF3c9B7e2D1f6A5c3B9;
+
+        admin = msg.sender;
+        guardian = 0xF3bA6c1D9e2A7B4c1D0eF8a3b6C1d9E2a7B4c1D0;
+        proposedAdmin = address(0);
+        paused = false;
+
+        // Parameters: non-default, bounded
+        feeBaseBps = 18; // 0.18%
+        feeMaxBps = 88; // 0.88%
+        gammaE8 = 413_700_000; // 4.137x
+        oraclePeriod = 37; // seconds
+        oracleSlots = 197;
+
+        lastSyncTs = uint64(block.timestamp);
+
+        // Protocol fee defaults
+        protocolOn = true;
+        feeTo = 0x0bA6D1E3f7c9B2a6d1e3F7C9b2A6D1e3F7c9B2A6;
+        protocolShareBps = 777; // 7.77% of swap fee
+        accrued0 = 0;
+        accrued1 = 0;
+
+        POOL_SALT = keccak256(
+            abi.encodePacked(
+                bytes20(uint160(uint256(keccak256("Quantguriosa:pool:salt")))),
+                block.chainid,
+                address(this),
+                address(token0),
+                address(token1),
+                GENESIS_ANCHOR,
+                GENESIS_LANTERN,
+                GENESIS_WARD
+            )
+        );
