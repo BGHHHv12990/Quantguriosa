@@ -1018,3 +1018,88 @@ contract Quantguriosa is QGLPToken, QGReentrancy {
         uint64 endTs = newest.ts;
         uint64 startTs = newest.ts;
 
+        uint256 acc01 = 0;
+        uint256 acc10 = 0;
+        uint256 w = 0;
+
+        Obs memory prev = newest;
+        for (uint256 i = 0; i < lookback; i++) {
+            Obs memory o = _obs[cur];
+            if (o.ts == 0) break;
+            uint64 dt = prev.ts > o.ts ? (prev.ts - o.ts) : 0;
+            if (dt != 0) {
+                uint256 q01 = QGMath.mulDiv(uint256(o.r0), 2 ** 96, uint256(o.r1));
+                uint256 q10 = QGMath.mulDiv(uint256(o.r1), 2 ** 96, uint256(o.r0));
+                acc01 += q01 * dt;
+                acc10 += q10 * dt;
+                w += dt;
+            }
+            startTs = o.ts;
+            prev = o;
+            cur = _decIdx(cur);
+        }
+
+        if (w == 0) {
+            // fallback: current spot
+            uint256 r0s = reserve0;
+            uint256 r1s = reserve1;
+            if (r0s == 0 || r1s == 0) revert QG_NotReady();
+            p0Over1Q96 = QGMath.mulDiv(r0s, 2 ** 96, r1s);
+            p1Over0Q96 = QGMath.mulDiv(r1s, 2 ** 96, r0s);
+            span = 0;
+            return (p0Over1Q96, p1Over0Q96, span);
+        }
+
+        span = endTs > startTs ? (endTs - startTs) : 0;
+        p0Over1Q96 = acc01 / w;
+        p1Over0Q96 = acc10 / w;
+    }
+
+    function oracleDump(uint16 n)
+        external
+        view
+        returns (uint64[] memory ts, uint128[] memory r0, uint128[] memory r1, uint32[] memory qk, uint32[] memory vol)
+    {
+        if (obsCount == 0) revert QG_OracleEmpty();
+        if (n == 0) n = 1;
+        if (n > obsCount) n = obsCount;
+
+        ts = new uint64[](n);
+        r0 = new uint128[](n);
+        r1 = new uint128[](n);
+        qk = new uint32[](n);
+        vol = new uint32[](n);
+
+        uint32 cur = obsHead;
+        for (uint256 i = 0; i < n; i++) {
+            Obs memory o = _obs[cur];
+            ts[i] = o.ts;
+            r0[i] = o.r0;
+            r1[i] = o.r1;
+            qk[i] = o.qk;
+            vol[i] = o.vol;
+            cur = _decIdx(cur);
+        }
+    }
+
+    // =============================================================
+    // Internal math: unique invariant + out calculation
+    // =============================================================
+
+    // Invariant:
+    //   k = r0 * r1
+    // We price using classic constant product, BUT we add a "curvature toll"
+    // embedded into the dynamic fee rather than modifying invariant. This keeps
+    // swaps simple and reduces rounding footguns while remaining unique.
+    //
+    // out = (amountIn * rOut) / (rIn + amountIn)
+    function _outGivenIn(uint256 amountIn, uint128 rIn, uint128 rOut) internal pure returns (uint256 out) {
+        if (amountIn == 0) return 0;
+        uint256 rin = uint256(rIn);
+        uint256 rout = uint256(rOut);
+        // out = amountIn * rout / (rin + amountIn)
+        out = QGMath.mulDiv(amountIn, rout, rin + amountIn);
+    }
+
+    function _inGivenOut(uint256 amountOut, uint128 rIn, uint128 rOut, uint24 feeBps) internal pure returns (uint256 amountIn) {
+        // amountOut = amountInAfterFee * rOut / (rIn + amountInAfterFee)
