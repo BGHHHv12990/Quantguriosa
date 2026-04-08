@@ -933,3 +933,88 @@ contract Quantguriosa is QGLPToken, QGReentrancy {
             token0.safeTransfer(feeTo, protoCut);
         } else {
             uint256 ny = uint256(accrued1) + protoCut;
+            if (ny > type(uint128).max) revert QG_TooLarge();
+            accrued1 = uint128(ny);
+            token1.safeTransfer(feeTo, protoCut);
+        }
+    }
+
+    // =============================================================
+    // Skim/sync
+    // =============================================================
+
+    function skim(address to) external nonReentrant whenActive {
+        if (to == address(0)) revert QG_Zero();
+        uint256 b0 = token0.balanceOf(address(this));
+        uint256 b1 = token1.balanceOf(address(this));
+
+        uint256 r0 = reserve0;
+        uint256 r1 = reserve1;
+
+        uint256 ex0 = b0 > r0 ? (b0 - r0) : 0;
+        uint256 ex1 = b1 > r1 ? (b1 - r1) : 0;
+
+        if (ex0 != 0) token0.safeTransfer(to, ex0);
+        if (ex1 != 0) token1.safeTransfer(to, ex1);
+
+        emit QG_Skimmed(to, ex0, ex1);
+    }
+
+    function sync() external nonReentrant whenActive {
+        uint256 b0 = token0.balanceOf(address(this));
+        uint256 b1 = token1.balanceOf(address(this));
+        if (b0 > type(uint128).max || b1 > type(uint128).max) revert QG_TooLarge();
+        _setReserves(uint128(b0), uint128(b1));
+        _maybePushOracle();
+    }
+
+    // =============================================================
+    // Oracle: push + consult
+    // =============================================================
+
+    function oracleLatest() external view returns (Obs memory o) {
+        if (obsCount == 0) revert QG_OracleEmpty();
+        return _obs[obsHead];
+    }
+
+    function oracleAt(uint32 idx) external view returns (Obs memory o) {
+        if (obsCount == 0) revert QG_OracleEmpty();
+        return _obs[idx];
+    }
+
+    function consultVolatility(uint16 lookback) external view returns (uint32 volQ, uint32 kQ, uint64 age) {
+        if (obsCount == 0) revert QG_OracleEmpty();
+        if (lookback == 0) lookback = 1;
+        if (lookback > obsCount) lookback = obsCount;
+
+        uint32 head = obsHead;
+        Obs memory newest = _obs[head];
+        uint32 cur = head;
+
+        uint256 acc = 0;
+        uint256 n = 0;
+
+        for (uint256 i = 0; i < lookback; i++) {
+            Obs memory o = _obs[cur];
+            if (o.ts == 0) break;
+            acc += uint256(o.vol);
+            n += 1;
+            cur = _decIdx(cur);
+        }
+
+        uint32 v = n == 0 ? 0 : uint32(acc / n);
+        uint64 nowTs = uint64(block.timestamp);
+        age = nowTs > newest.ts ? (nowTs - newest.ts) : 0;
+        return (v, newest.qk, age);
+    }
+
+    function consultTwapQ96(uint16 lookback) external view returns (uint256 p0Over1Q96, uint256 p1Over0Q96, uint64 span) {
+        if (obsCount == 0) revert QG_OracleEmpty();
+        if (lookback == 0) lookback = 1;
+        if (lookback > obsCount) lookback = obsCount;
+
+        uint32 cur = obsHead;
+        Obs memory newest = _obs[cur];
+        uint64 endTs = newest.ts;
+        uint64 startTs = newest.ts;
+
