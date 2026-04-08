@@ -1103,3 +1103,88 @@ contract Quantguriosa is QGLPToken, QGReentrancy {
 
     function _inGivenOut(uint256 amountOut, uint128 rIn, uint128 rOut, uint24 feeBps) internal pure returns (uint256 amountIn) {
         // amountOut = amountInAfterFee * rOut / (rIn + amountInAfterFee)
+        // Solve for amountInAfterFee: ain = (rIn * amountOut) / (rOut - amountOut)
+        uint256 rin = uint256(rIn);
+        uint256 rout = uint256(rOut);
+        if (amountOut >= rout) revert QG_Slippage();
+        uint256 ainAfter = QGMath.mulDiv(rin, amountOut, rout - amountOut);
+        // gross up for fee: amountIn = ainAfter / (1 - fee)
+        uint256 denom = _MAX_BPS - uint256(feeBps);
+        if (denom == 0) revert QG_FeeTooHigh();
+        amountIn = QGMath.mulDiv(ainAfter, _MAX_BPS, denom);
+        // bump by 1 wei to be safe for rounding
+        unchecked {
+            amountIn += 1;
+        }
+    }
+
+    // =============================================================
+    // Oracle-driven fee: base + volatility slope
+    // =============================================================
+
+    function currentFeeBps() external view returns (uint24 feeBps, uint32 volQ, uint32 kQ) {
+        (uint128 r0, uint128 r1) = (reserve0, reserve1);
+        if (r0 == 0 || r1 == 0) return (feeBaseBps, 0, 0);
+        return _feeFromOracleView(r0, r1);
+    }
+
+    function _feeFromOracleView(uint128 r0, uint128 r1) internal view returns (uint24 fee, uint32 volQ, uint32 kQ) {
+        uint24 base = feeBaseBps;
+        uint24 cap = feeMaxBps;
+        uint32 gamma = gammaE8;
+
+        uint32 v = 0;
+        uint32 k = _quantizeK(uint256(r0) * uint256(r1), r0, r1);
+        if (obsCount != 0) {
+            Obs memory o = _obs[obsHead];
+            v = o.vol;
+            // if reserves diverged drastically from last obs, add a small penalty into v
+            uint256 drift = QGMath.absDiff(uint256(o.r0) * uint256(o.r1), uint256(r0) * uint256(r1));
+            uint256 denom = uint256(o.r0) * uint256(o.r1) + 1;
+            uint256 driftBps = (drift * 10_000) / denom;
+            if (driftBps > 0) {
+                uint256 add = QGMath.min(driftBps * 9, 50_000);
+                v = uint32(QGMath.min(uint256(v) + add, type(uint32).max));
+            }
+        }
+
+        // extra = base * gamma * v / (1e8 * 1e6) (v ~ 1e6-ish)
+        // clamp to cap
+        uint256 extra = (uint256(base) * uint256(gamma) * uint256(v)) / (1e8 * 1_000_000);
+        uint256 f = uint256(base) + extra;
+        if (f > cap) f = cap;
+        return (uint24(f), v, k);
+    }
+
+    function _feeFromOracle(uint128 r0, uint128 r1) internal returns (uint24 fee, uint32 volQ, uint32 kQ) {
+        // Ensure oracle sample exists when possible
+        _maybePushOracle();
+        return _feeFromOracleView(r0, r1);
+    }
+
+    // =============================================================
+    // Reserve + oracle housekeeping
+    // =============================================================
+
+    function _syncReserves() internal returns (uint128 r0, uint128 r1) {
+        r0 = reserve0;
+        r1 = reserve1;
+        // if someone transferred tokens in/out without calling sync,
+        // we don't auto-resync here (to keep swap deterministic on inputs),
+        // but we update lastSyncTs so the oracle isn't tricked into thinking it's stale.
+        lastSyncTs = uint64(block.timestamp);
+        return (r0, r1);
+    }
+
+    function _setReserves(uint128 b0, uint128 b1) internal {
+        reserve0 = b0;
+        reserve1 = b1;
+        lastSyncTs = uint64(block.timestamp);
+    }
+
+    function _maybePushOracle() internal {
+        // push only if period passed OR if oracle empty
+        uint64 nowTs = uint64(block.timestamp);
+        if (obsCount != 0) {
+            Obs memory last = _obs[obsHead];
+            if (nowTs < last.ts + oraclePeriod) return;
