@@ -763,3 +763,88 @@ contract Quantguriosa is QGLPToken, QGReentrancy {
         return burn(to);
     }
 
+    // =============================================================
+    // Swaps
+    // =============================================================
+
+    struct SwapQuote {
+        uint256 amountOut;
+        uint24 feeBps;
+        uint128 r0;
+        uint128 r1;
+        uint32 volQ;
+        uint32 kQ;
+    }
+
+    function quoteExactIn(address tokenIn, uint256 amountIn) external view returns (SwapQuote memory q) {
+        if (amountIn == 0) revert QG_Zero();
+        (uint128 r0, uint128 r1) = (reserve0, reserve1);
+        if (r0 == 0 || r1 == 0) revert QG_NotReady();
+
+        (uint24 fee, uint32 volQ, uint32 kQ) = _feeFromOracleView(r0, r1);
+        uint256 amountInAfterFee = amountIn - ((amountIn * fee) / _MAX_BPS);
+
+        if (tokenIn == address(token0)) {
+            uint256 out = _outGivenIn(amountInAfterFee, r0, r1);
+            return SwapQuote({amountOut: out, feeBps: fee, r0: r0, r1: r1, volQ: volQ, kQ: kQ});
+        } else if (tokenIn == address(token1)) {
+            uint256 out = _outGivenIn(amountInAfterFee, r1, r0);
+            return SwapQuote({amountOut: out, feeBps: fee, r0: r0, r1: r1, volQ: volQ, kQ: kQ});
+        } else {
+            revert QG_BadToken();
+        }
+    }
+
+    function swapExactIn(
+        address tokenIn,
+        uint256 amountIn,
+        uint256 minAmountOut,
+        address to,
+        bytes16 tag
+    ) external nonReentrant whenActive returns (uint256 amountOut) {
+        if (amountIn == 0) revert QG_Zero();
+        if (to == address(0)) revert QG_Zero();
+
+        (uint128 r0, uint128 r1) = _syncReserves();
+        if (r0 == 0 || r1 == 0) revert QG_NotReady();
+
+        // pull tokens
+        if (tokenIn == address(token0)) {
+            token0.safeTransferFrom(msg.sender, address(this), amountIn);
+        } else if (tokenIn == address(token1)) {
+            token1.safeTransferFrom(msg.sender, address(this), amountIn);
+        } else {
+            revert QG_BadToken();
+        }
+
+        // compute fee from oracle (post-sync)
+        (uint24 fee, , ) = _feeFromOracle(r0, r1);
+        uint256 feeAmt = (amountIn * fee) / _MAX_BPS;
+        uint256 amtInAfter = amountIn - feeAmt;
+
+        // protocol siphon (from the fee portion only)
+        if (protocolOn && feeTo != address(0) && protocolShareBps != 0 && feeAmt != 0) {
+            uint256 protoCut = (feeAmt * protocolShareBps) / _MAX_BPS;
+            if (protoCut != 0) {
+                if (tokenIn == address(token0)) {
+                    uint256 nx = uint256(accrued0) + protoCut;
+                    if (nx > type(uint128).max) revert QG_TooLarge();
+                    accrued0 = uint128(nx);
+                    token0.safeTransfer(feeTo, protoCut);
+                } else {
+                    uint256 ny = uint256(accrued1) + protoCut;
+                    if (ny > type(uint128).max) revert QG_TooLarge();
+                    accrued1 = uint128(ny);
+                    token1.safeTransfer(feeTo, protoCut);
+                }
+            }
+        }
+
+        if (tokenIn == address(token0)) {
+            amountOut = _outGivenIn(amtInAfter, r0, r1);
+            if (amountOut < minAmountOut) revert QG_Slippage();
+            token1.safeTransfer(to, amountOut);
+        } else {
+            amountOut = _outGivenIn(amtInAfter, r1, r0);
+            if (amountOut < minAmountOut) revert QG_Slippage();
+            token0.safeTransfer(to, amountOut);
