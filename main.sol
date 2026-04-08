@@ -593,3 +593,88 @@ contract Quantguriosa is QGLPToken, QGReentrancy {
                 GENESIS_WARD
             )
         );
+
+        // initialize oracle with empty
+        obsHead = 0;
+        obsCount = 0;
+    }
+
+    // =============================================================
+    // Admin controls
+    // =============================================================
+
+    function proposeAdmin(address next) external onlyAdmin {
+        if (next == address(0)) revert QG_Zero();
+        proposedAdmin = next;
+        emit QG_AdminProposed(admin, next);
+    }
+
+    function acceptAdmin() external {
+        address p = proposedAdmin;
+        if (p == address(0) || msg.sender != p) revert QG_Unauthorized();
+        address old = admin;
+        admin = p;
+        proposedAdmin = address(0);
+        emit QG_AdminAccepted(old, p);
+    }
+
+    function setGuardian(address next) external onlyAdmin {
+        if (next == address(0)) revert QG_Zero();
+        address old = guardian;
+        if (old == next) revert QG_Same();
+        guardian = next;
+        emit QG_GuardianSet(old, next);
+    }
+
+    function setPaused(bool on) external onlyGuardian {
+        if (paused == on) revert QG_Same();
+        paused = on;
+        emit QG_PauseSet(on);
+    }
+
+    function setParams(uint24 feeBaseBps_, uint24 feeMaxBps_, uint32 gammaE8_, uint32 oraclePeriod_, uint16 oracleSlots_)
+        external
+        onlyAdmin
+    {
+        if (feeBaseBps_ == 0 || feeMaxBps_ == 0) revert QG_Zero();
+        if (feeBaseBps_ > feeMaxBps_) revert QG_Bounds();
+        if (feeMaxBps_ > 499) revert QG_FeeTooHigh(); // absolute cap 4.99%
+        if (gammaE8_ < _MIN_GAMMA_E8 || gammaE8_ > _MAX_GAMMA_E8) revert QG_Bounds();
+        if (oraclePeriod_ < _MIN_ORACLE_PERIOD || oraclePeriod_ > _MAX_ORACLE_PERIOD) revert QG_Bounds();
+        if (oracleSlots_ < _MIN_SLOTS || oracleSlots_ > _MAX_SLOTS) revert QG_Bounds();
+
+        feeBaseBps = feeBaseBps_;
+        feeMaxBps = feeMaxBps_;
+        gammaE8 = gammaE8_;
+        oraclePeriod = oraclePeriod_;
+        oracleSlots = oracleSlots_;
+
+        emit QG_ParamsSet(feeBaseBps_, feeMaxBps_, gammaE8_, oraclePeriod_, oracleSlots_);
+    }
+
+    function setProtocol(address feeTo_, uint16 protocolShareBps_, bool on) external onlyAdmin {
+        if (feeTo_ == address(0)) revert QG_Zero();
+        if (protocolShareBps_ > _MAX_PROTOCOL_SHARE_BPS) revert QG_Bounds();
+        feeTo = feeTo_;
+        protocolShareBps = protocolShareBps_;
+        protocolOn = on;
+        emit QG_ProtocolSet(feeTo_, protocolShareBps_, on);
+    }
+
+    function collectProtocolFees(address to) external nonReentrant onlyAdmin returns (uint256 a0, uint256 a1) {
+        if (!protocolOn) revert QG_ProtocolOff();
+        if (to == address(0)) revert QG_Zero();
+
+        a0 = accrued0;
+        a1 = accrued1;
+        accrued0 = 0;
+        accrued1 = 0;
+
+        if (a0 != 0) token0.safeTransfer(to, a0);
+        if (a1 != 0) token1.safeTransfer(to, a1);
+
+        // update reserves post-transfer
+        uint256 b0 = token0.balanceOf(address(this));
+        uint256 b1 = token1.balanceOf(address(this));
+        if (b0 > type(uint128).max || b1 > type(uint128).max) revert QG_TooLarge();
+        _setReserves(uint128(b0), uint128(b1));
