@@ -848,3 +848,88 @@ contract Quantguriosa is QGLPToken, QGReentrancy {
             amountOut = _outGivenIn(amtInAfter, r1, r0);
             if (amountOut < minAmountOut) revert QG_Slippage();
             token0.safeTransfer(to, amountOut);
+        }
+
+        // update reserves to actual balances
+        uint256 b0 = token0.balanceOf(address(this));
+        uint256 b1 = token1.balanceOf(address(this));
+        if (b0 > type(uint128).max || b1 > type(uint128).max) revert QG_TooLarge();
+        _setReserves(uint128(b0), uint128(b1));
+
+        _maybePushOracle();
+
+        address tokenOut = tokenIn == address(token0) ? address(token1) : address(token0);
+        emit QG_Swapped(msg.sender, tokenIn, amountIn, tokenOut, amountOut, fee, tag);
+    }
+
+    function quoteExactOut(address tokenOut, uint256 amountOut) external view returns (uint256 amountIn, uint24 feeBps) {
+        if (amountOut == 0) revert QG_Zero();
+        (uint128 r0, uint128 r1) = (reserve0, reserve1);
+        if (r0 == 0 || r1 == 0) revert QG_NotReady();
+
+        (uint24 fee, , ) = _feeFromOracleView(r0, r1);
+        feeBps = fee;
+
+        if (tokenOut == address(token1)) {
+            amountIn = _inGivenOut(amountOut, r0, r1, fee);
+        } else if (tokenOut == address(token0)) {
+            amountIn = _inGivenOut(amountOut, r1, r0, fee);
+        } else {
+            revert QG_BadToken();
+        }
+    }
+
+    function swapExactOut(
+        address tokenOut,
+        uint256 amountOut,
+        uint256 maxAmountIn,
+        address to,
+        bytes16 tag
+    ) external nonReentrant whenActive returns (uint256 amountIn) {
+        if (amountOut == 0) revert QG_Zero();
+        if (to == address(0)) revert QG_Zero();
+        (uint128 r0, uint128 r1) = _syncReserves();
+        if (r0 == 0 || r1 == 0) revert QG_NotReady();
+
+        (uint24 fee, , ) = _feeFromOracle(r0, r1);
+
+        if (tokenOut == address(token1)) {
+            amountIn = _inGivenOut(amountOut, r0, r1, fee);
+            if (amountIn > maxAmountIn) revert QG_Slippage();
+            token0.safeTransferFrom(msg.sender, address(this), amountIn);
+            token1.safeTransfer(to, amountOut);
+            _siphonProtocol(address(token0), amountIn, fee);
+            emit QG_Swapped(msg.sender, address(token0), amountIn, address(token1), amountOut, fee, tag);
+        } else if (tokenOut == address(token0)) {
+            amountIn = _inGivenOut(amountOut, r1, r0, fee);
+            if (amountIn > maxAmountIn) revert QG_Slippage();
+            token1.safeTransferFrom(msg.sender, address(this), amountIn);
+            token0.safeTransfer(to, amountOut);
+            _siphonProtocol(address(token1), amountIn, fee);
+            emit QG_Swapped(msg.sender, address(token1), amountIn, address(token0), amountOut, fee, tag);
+        } else {
+            revert QG_BadToken();
+        }
+
+        // update reserves
+        uint256 b0 = token0.balanceOf(address(this));
+        uint256 b1 = token1.balanceOf(address(this));
+        if (b0 > type(uint128).max || b1 > type(uint128).max) revert QG_TooLarge();
+        _setReserves(uint128(b0), uint128(b1));
+        _maybePushOracle();
+    }
+
+    function _siphonProtocol(address tokenIn, uint256 amountIn, uint24 fee) internal {
+        // same logic as swapExactIn but extracted for exactOut path
+        uint256 feeAmt = (amountIn * fee) / _MAX_BPS;
+        if (!protocolOn || feeTo == address(0) || protocolShareBps == 0 || feeAmt == 0) return;
+        uint256 protoCut = (feeAmt * protocolShareBps) / _MAX_BPS;
+        if (protoCut == 0) return;
+
+        if (tokenIn == address(token0)) {
+            uint256 nx = uint256(accrued0) + protoCut;
+            if (nx > type(uint128).max) revert QG_TooLarge();
+            accrued0 = uint128(nx);
+            token0.safeTransfer(feeTo, protoCut);
+        } else {
+            uint256 ny = uint256(accrued1) + protoCut;
