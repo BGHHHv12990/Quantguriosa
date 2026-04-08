@@ -678,3 +678,88 @@ contract Quantguriosa is QGLPToken, QGReentrancy {
         uint256 b1 = token1.balanceOf(address(this));
         if (b0 > type(uint128).max || b1 > type(uint128).max) revert QG_TooLarge();
         _setReserves(uint128(b0), uint128(b1));
+        _maybePushOracle();
+
+        emit QG_ProtocolCollected(to, a0, a1);
+    }
+
+    // =============================================================
+    // Liquidity: mint/burn
+    // =============================================================
+
+    function mint(address to) external nonReentrant whenActive returns (uint256 sharesOut) {
+        if (to == address(0)) revert QG_Zero();
+        (uint128 r0, uint128 r1) = _syncReserves();
+
+        uint256 b0 = token0.balanceOf(address(this));
+        uint256 b1 = token1.balanceOf(address(this));
+
+        uint256 a0In = b0 - uint256(r0);
+        uint256 a1In = b1 - uint256(r1);
+        if (a0In == 0 || a1In == 0) revert QG_NoLiquidity();
+        if (a0In > type(uint128).max || a1In > type(uint128).max) revert QG_TooLarge();
+
+        uint256 ts = totalSupply;
+        if (ts == 0) {
+            // initial mint: geometric mean minus min lock
+            uint256 root = QGMath.sqrt(a0In * a1In);
+            if (root <= _MIN_LIQ) revert QG_NoLiquidity();
+            sharesOut = root - _MIN_LIQ;
+            _mint(address(0x000000000000000000000000000000000000dEaD), _MIN_LIQ);
+            _mint(to, sharesOut);
+        } else {
+            uint256 s0 = (a0In * ts) / uint256(r0);
+            uint256 s1 = (a1In * ts) / uint256(r1);
+            sharesOut = QGMath.min(s0, s1);
+            if (sharesOut == 0) revert QG_NoLiquidity();
+            _mint(to, sharesOut);
+        }
+
+        // update reserves to balances
+        _setReserves(uint128(b0), uint128(b1));
+        _maybePushOracle();
+
+        emit QG_Minted(msg.sender, a0In, a1In, sharesOut, to);
+    }
+
+    function burn(address to) external nonReentrant whenActive returns (uint256 amount0Out, uint256 amount1Out) {
+        if (to == address(0)) revert QG_Zero();
+        (uint128 r0, uint128 r1) = _syncReserves();
+        uint256 sharesIn = balanceOf[address(this)];
+        if (sharesIn == 0) revert QG_NoLiquidity();
+
+        uint256 ts = totalSupply;
+        amount0Out = (sharesIn * uint256(r0)) / ts;
+        amount1Out = (sharesIn * uint256(r1)) / ts;
+        if (amount0Out == 0 || amount1Out == 0) revert QG_NoLiquidity();
+
+        _burn(address(this), sharesIn);
+        token0.safeTransfer(to, amount0Out);
+        token1.safeTransfer(to, amount1Out);
+
+        // update reserves
+        uint256 b0 = token0.balanceOf(address(this));
+        uint256 b1 = token1.balanceOf(address(this));
+        _setReserves(uint128(b0), uint128(b1));
+        _maybePushOracle();
+
+        emit QG_Burned(msg.sender, sharesIn, amount0Out, amount1Out, to);
+    }
+
+    // helper: send shares to pool then call burn
+    function burnFrom(address from, address to, uint256 sharesIn) external nonReentrant whenActive returns (uint256 a0, uint256 a1) {
+        if (from == address(0) || to == address(0)) revert QG_Zero();
+        if (sharesIn == 0) revert QG_Zero();
+
+        // pull shares
+        uint256 a = allowance[from][msg.sender];
+        if (a != type(uint256).max) {
+            if (a < sharesIn) revert QGLP_Allowance();
+            unchecked {
+                allowance[from][msg.sender] = a - sharesIn;
+            }
+        }
+        _transfer(from, address(this), sharesIn);
+        return burn(to);
+    }
+
